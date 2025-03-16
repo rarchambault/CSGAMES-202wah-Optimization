@@ -146,7 +146,7 @@ def find_matching_customer(customer_worder, customers):
         print(f"No customer found with Id {customer_id}")
         return None
 
-def find_customer_by_id(customer_id, customers_worders):
+def find_customer_orders_by_customer_id(customer_id, customers_worders):
     """Find a customer by their Id and return their orders."""
     customer = next((c for c in customers_worders if c["Id"] == customer_id), None)
     if customer:
@@ -154,6 +154,59 @@ def find_customer_by_id(customer_id, customers_worders):
     else:
         print(f"No customer found with Id {customer_id}")
         return None
+
+# Function to assign customers to warehouses with knapsack-like optimization
+def assign_customers_to_warehouses(day_data, warehouses, customers, warehouse_stocks):
+    customer_assignments = {}
+
+    # Sort customers by proximity to warehouses and prioritize based on order size
+    for customer in day_data["Customers"]:
+        best_warehouse = None
+        remaining_orders = customer["Orders"]
+
+        # List all possible warehouses based on available Lego stock
+        for order in remaining_orders:
+            lego_id = order["LegoId"]
+            required_quantity = order["Quantity"]
+
+            # Find warehouses that have enough stock for this order
+            possible_warehouses = [
+                w for w in day_data["Warehouses"]
+                if lego_id in warehouse_stocks[w["Id"]] and warehouse_stocks[w["Id"]][lego_id] >= required_quantity
+            ]
+            
+            if not possible_warehouses:
+                print(f"Warning: No warehouse has enough stock for LegoId {lego_id} and quantity {required_quantity}")
+                continue
+
+            # Sort the possible warehouses by proximity to the customer
+            customer_wcoords = find_matching_customer(customer, customers)
+            sorted_warehouses = sorted(
+                possible_warehouses, 
+                key=lambda w: manhattan_distance(
+                    (customer_wcoords["Coordinates"]["X"], customer_wcoords["Coordinates"]["Y"]),
+                    (warehouses[w["Id"]]["Coordinates"]["X"], warehouses[w["Id"]]["Coordinates"]["Y"])
+                )
+            )
+
+            # Try to assign the best warehouse based on proximity and stock availability
+            assigned = False
+            for warehouse in sorted_warehouses:
+                warehouse_id = warehouse["Id"]
+                if warehouse_stocks[warehouse_id][lego_id] >= required_quantity:
+                    # Assign the warehouse to the customer for this Lego order
+                    customer_assignments[customer["Id"]] = warehouse_id
+
+                    # Reduce the stock in the warehouse for this Lego
+                    warehouse_stocks[warehouse_id][lego_id] -= required_quantity
+                    assigned = True
+                    break
+
+            if not assigned:
+                print(f"Warning: Couldn't fulfill the order for LegoId {lego_id} and quantity {required_quantity} for customer {customer['Id']}.")
+
+    return customer_assignments
+
 
 def optimize_delivery_route(day_data, city_layout):
     """Generate an optimized delivery route for a given day."""
@@ -212,65 +265,83 @@ def optimize_delivery_route(day_data, city_layout):
 
     elif day_number == 3:
         # **Day 3: Multiple Warehouses, Multiple Trucks, Limited Capacity**
-        trucks = day_data["Trucks"]
-        truck_routes = {t["Id"]: [] for t in trucks}
-        warehouse_stocks = extract_warehouse_stocks(day_data)
-        customers_worders = day_data["Customers"]
+        day_number = day_data["DayNumber"]
+        steps = []
         
-        # Assign customers to the closest warehouse based on their orders and available Legos
-        customer_assignments = {}
-        for customer_worder in customers_worders:
-            best_warehouse = None
-            for order in customer_worder["Orders"]:
-                # Find the best warehouse with the Lego stock needed for the order
-                possible_warehouses = [
-                    w for w in day_data["Warehouses"] if order["LegoId"] in warehouse_stocks[w["Id"]]
-                ]
-                customer_wcoords = find_matching_customer(customer_worder, customers)
-                closest = find_closest_warehouse(customer_wcoords, possible_warehouses, city_layout)
-                best_warehouse = closest["Id"]
-                customer_assignments[customer_worder["Id"]] = best_warehouse
+        # Extract locations and stocks
+        warehouses = {w["Id"]: w for w in city_layout["Warehouses"]}
+        customers = {c["Id"]: c for c in city_layout["Customers"]}
+        warehouse_stocks = extract_warehouse_stocks(day_data)
+        trucks = day_data["Trucks"]
+        
+        # Use the optimized customer assignment function
+        customer_assignments = assign_customers_to_warehouses(day_data, warehouses, customers, warehouse_stocks)
 
-        # Now assign trucks to deliveries, balancing the load and minimizing distance
+        # Group customers by warehouse
+        warehouse_customer_map = {w_id: [] for w_id in warehouse_stocks.keys()}
         for customer_id, warehouse_id in customer_assignments.items():
+            warehouse_customer_map[warehouse_id].append(customer_id)
+        
+        # Assign trucks to deliveries for each warehouse
+        truck_routes = {t["Id"]: [] for t in trucks}
+        for warehouse_id, customer_ids in warehouse_customer_map.items():
             assigned_trucks = [t for t in trucks if t["AffiliatedWarehouseId"] == warehouse_id]
-            if assigned_trucks:
-                # For simplicity, choose the first truck available for this warehouse
-                truck_routes[assigned_trucks[0]["Id"]].append(customer_id)
-
-        # Perform the deliveries
+            if not assigned_trucks:
+                continue
+            
+            # Balance the load across trucks
+            truck_count = len(assigned_trucks)
+            customers_per_truck = len(customer_ids) // truck_count
+            for i, truck in enumerate(assigned_trucks):
+                start_idx = i * customers_per_truck
+                end_idx = (i + 1) * customers_per_truck if i < truck_count - 1 else len(customer_ids)
+                truck_routes[truck["Id"]] = customer_ids[start_idx:end_idx]
+        
+        # Perform deliveries
         for truck_id, assigned_customers in truck_routes.items():
             truck = trucks[truck_id]
             warehouse_id = truck["AffiliatedWarehouseId"]
-
-            # Load the necessary Lego quantities onto the truck
+            
+            # Collect all orders for the truck and group them by customer
+            truck_orders = {}
             for customer_id in assigned_customers:
-                orders = find_customer_by_id(customer_id, customers_worders)
+                orders = next(c["Orders"] for c in day_data["Customers"] if c["Id"] == customer_id)
                 for order in orders:
-                    steps.append(f"load truck={truck_id} quantity={order['Quantity']} lego={order['LegoId']}")
-
-            # Use Nearest Neighbor or similar algorithm to optimize route
+                    if customer_id not in truck_orders:
+                        truck_orders[customer_id] = []
+                    truck_orders[customer_id].append(order)
+            
+            # Optimize the truck route to minimize travel time
             customer_coords = [
-                (c["Id"], (c["Coordinates"]["X"], c["Coordinates"]["Y"])) 
-                for c in customers.values()
+                (c["Id"], (customers[c["Id"]]["Coordinates"]["X"], customers[c["Id"]]["Coordinates"]["Y"])) 
+                for c in day_data["Customers"]
             ]
+            
+            # Create optimized route for the truck
             optimized_route = nearest_neighbor_path(
                 (warehouses[warehouse_id]["Coordinates"]["X"], warehouses[warehouse_id]["Coordinates"]["Y"]),
                 [c[1] for c in customer_coords]
             )
-
-            # Perform deliveries and return truck to warehouse
-            for coords in optimized_route:
-                customer = next(
-                    c for c in customers.values() 
-                    if (c["Coordinates"]["X"], c["Coordinates"]["Y"]) == coords
-                )
-                orders = find_customer_by_id(customer["Id"], customers_worders)
+            
+            # Load all Legos at once for the truck
+            for customer_id, orders in truck_orders.items():
                 for order in orders:
+                    steps.append(f"load truck={truck_id} quantity={order['Quantity']} lego={order['LegoId']}")
+            
+            # Consolidate the delivery steps into a single trip per customer
+            for coords in optimized_route:
+                customer = next(c for c in day_data["Customers"] if 
+                                (customers[c["Id"]]["Coordinates"]["X"], customers[c["Id"]]["Coordinates"]["Y"]) == coords)
+                orders = truck_orders.get(customer["Id"], [])
+                if orders:
+                    # Move to customer
                     steps.append(f"move_to_customer truck={truck_id} customer={customer['Id']}")
-                    steps.append(f"deliver truck={truck_id} quantity={order['Quantity']} lego={order['LegoId']}")
-
-            # Return truck to warehouse
+                    
+                    # Deliver all orders to that customer at once
+                    for order in orders:
+                        steps.append(f"deliver truck={truck_id} quantity={order['Quantity']} lego={order['LegoId']}")
+            
+            # Return truck to warehouse in one final step
             steps.append(f"move_to_warehouse truck={truck_id} warehouse={warehouse_id}")
 
     return {
