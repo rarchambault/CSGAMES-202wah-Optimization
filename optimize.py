@@ -80,6 +80,10 @@ def main():
     # Load city layout
     city_layout = load_json("las_brickas.json")
 
+    # Extract and sort customer coordinates by ID
+    sorted_customers = sorted(city_layout["Customers"], key=lambda c: c["Id"])
+    coordinates_list = [(c["Coordinates"]["X"], c["Coordinates"]["Y"]) for c in sorted_customers]
+
     # Solve and submit solutions for the first 3 days
     for day in range(1, 4):
         day_data = load_json(f"day_{day}.json")
